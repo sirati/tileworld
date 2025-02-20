@@ -1,12 +1,16 @@
 #![feature(new_zeroed_alloc)]
 #![feature(generic_const_exprs)]
 #![feature(portable_simd)]
+#![feature(trivial_bounds)]
+#![feature(transparent_unions)]
+#![feature(repr_simd)]
 
 use core::simd;
+use std::alloc::Layout;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Index, IndexMut};
-use std::simd::{mask8x64, u8x64, Simd};
+use std::simd::{mask8x64, u8x64, Simd, SimdElement};
 use not_zero::NotZero;
 mod not_zero;
 
@@ -31,7 +35,7 @@ impl<'a, Feature: TileWorldFeatureAccessorRaw> Into<&'a mut FeatureSubRegion<Fea
 
 impl SubRegionAligned {
     #[inline(always)]
-    const fn as_simd<const LANES: usize>(&self) -> &[Simd<u8, LANES>]
+    fn as_simd<const LANES: usize>(&self) -> &[Simd<u8, LANES>]
     where
         simd::LaneCount<LANES>: simd::SupportedLaneCount,
     {
@@ -45,14 +49,14 @@ impl SubRegionAligned {
     }
 
     #[inline(always)]
-    const fn as_simd64(&self) -> &Simd<u8, 64> {
+    fn as_simd64(&self) -> &Simd<u8, 64> {
         let lanes = self.as_simd::<64>();
         assert_eq!(lanes.len(), 1);
         &lanes[0]
     }
 
     #[inline(always)]
-    const fn as_simd_mut<const LANES: usize>(&mut self) -> &mut [Simd<u8, LANES>]
+    fn as_simd_mut<const LANES: usize>(&mut self) -> &mut [Simd<u8, LANES>]
     where
         simd::LaneCount<LANES>: simd::SupportedLaneCount,
     {
@@ -67,7 +71,7 @@ impl SubRegionAligned {
 
 
     #[inline(always)]
-    const fn as_simd64_mut(&mut self) -> &mut Simd<u8, 64> {
+    fn as_simd64_mut(&mut self) -> &mut Simd<u8, 64> {
         let lanes = self.as_simd_mut::<64>();
         assert_eq!(lanes.len(), 1);
         &mut lanes[0]
@@ -123,6 +127,7 @@ impl Index<usize> for SubRegionAligned {
 }
 
 
+#[repr(transparent)]
 struct FeatureSubRegion<Feature: TileWorldFeatureAccessorRaw>(SubRegionAligned, PhantomData<Feature>);
 
 impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
@@ -131,7 +136,7 @@ impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
     /// value is   00000###
     /// rest of date is replaced with 0 and value is low aligned
     #[inline(always)]
-    const fn simd_mask_shift(simd: &mut Simd<u8, 64>) {
+    fn simd_mask_shift(simd: &mut Simd<u8, 64>) {
         //all these ifs use CONST, so only the active branch actually is compiled
         if Feature::BITS == 8 {return}
         if Feature::OFFSET == 0 {
@@ -147,14 +152,14 @@ impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
     /// this masks the value but does not move them
     ///if low aligned values are required simd_mask_shift is more efficient
     #[inline(always)]
-    const fn simd_mask(simd: &mut Simd<u8, 64>) {
+    fn simd_mask(simd: &mut Simd<u8, 64>) {
         if Feature::BITS < 8 {
             *simd &= u8x64::splat(Feature::VAL_MASK);
         }
     }
 
     #[inline(always)]
-    const fn simd_low_align(simd: &mut Simd<u8, 64>) {
+    fn simd_low_align(simd: &mut Simd<u8, 64>) {
         if Feature::OFFSET > 0 {
             *simd >>= Feature::OFFSET;
         }
@@ -162,14 +167,14 @@ impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
 
 
     #[inline(always)]
-    const fn simd_unshift(simd: &mut Simd<u8, 64>) {
+    fn simd_unshift(simd: &mut Simd<u8, 64>) {
         if Feature::OFFSET > 0 {
             *simd <<= Feature::OFFSET;
         }
     }
 
     #[inline(always)]
-    const fn simd_prep_val<const MASK: bool, const SHIFT: bool>(simd: &mut Simd<u8, 64>) {
+    fn simd_prep_val<const MASK: bool, const SHIFT: bool>(simd: &mut Simd<u8, 64>) {
         match (MASK, SHIFT) {
             (true, true) => Self::simd_mask_shift(simd),
             (true, false) => Self::simd_mask(simd),
@@ -180,7 +185,7 @@ impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
 
 
     #[inline(always)]
-    const fn simd_unprep_val<const MASK: bool, const SHIFT: bool, const CLEAN: bool>(simd: &mut Simd<u8, 64>) {
+    fn simd_unprep_val<const MASK: bool, const SHIFT: bool, const CLEAN: bool>(simd: &mut Simd<u8, 64>) {
         //if BITS == 8 simd_unshift() and simd_mask() are empty
         if SHIFT {
             Self::simd_unshift(simd);
@@ -194,7 +199,7 @@ impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
     /// SHIFT will low align data
     /// CLEAN an unclean function will pollute storage that would be MASKED
     #[inline(always)]
-    const fn apply_selected<const MASK: bool, const SHIFT: bool, const CLEAN: bool>
+    fn apply_selected<const MASK: bool, const SHIFT: bool, const CLEAN: bool>
     (&mut self, func_simd: fn(&mut Simd<u8, 64>) -> mask8x64)
     {
         let mut simd = *self.0.as_simd64_mut();
@@ -213,7 +218,7 @@ impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
     /// SHIFT will low align data
     /// CLEAN an unclean function will pollute storage that would be MASKED
     #[inline(always)]
-    const fn apply<const MASK: bool, const SHIFT: bool, const CLEAN: bool>
+    fn apply<const MASK: bool, const SHIFT: bool, const CLEAN: bool>
     (&mut self, func_simd: fn(&mut Simd<u8, 64>))
     {
         let mut simd = *self.0.as_simd64_mut();
@@ -222,20 +227,39 @@ impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
         func_simd(&mut simd);
 
         Self::simd_unprep_val::<MASK, SHIFT, CLEAN>(&mut simd);
+        let this = self.0.as_simd64_mut();
         if (Feature::BITS < 8) {
-            simd |= *self.0.as_simd64_mut() & u8x64::splat(Feature::ERASE_MASK);
+            *this &= u8x64::splat(Feature::ERASE_MASK);
+            *this |= simd;
+        } else {
+            *this = simd;
         }
-        *self.0.0.as_flattened_mut()[0..64] = simd.as_array();
     }
 
     /// MASK will replace all other stored data with zero
     /// SHIFT will low align data
     #[inline(always)]
-    const fn inspect<const MASK: bool, const SHIFT: bool, Result>
-    (&self, func_simd: fn(&mut Simd<u8, 64>) -> Result)
+    fn inspect<const MASK: bool, const SHIFT: bool, Result>
+    (&self, func_simd: fn(&mut Simd<u8, 64>) -> Result) -> Result
     {
         let mut simd = *self.0.as_simd64();
         Self::simd_prep_val::<MASK, SHIFT>(&mut simd);
+
+        func_simd(&mut simd)
+    }
+
+    /// MASK will replace all other stored data with zero
+    /// SHIFT will low align data
+    #[inline(always)]
+    const fn inspect_typed<const MASK: bool, const SHIFT: bool, Result, T>
+    (&self, func_simd: fn(&mut Simd<TypedSimd<T, u8>, 64>) -> Result) -> Result
+    where Feature : TileWorldFeature<Layout, T>,
+          Layout: TileWorldLayoutDesc,
+          T: Copy
+    {
+        let mut simd = *self.0.as_simd64();
+        Self::simd_prep_val::<MASK, SHIFT>(&mut simd);
+
 
         func_simd(&mut simd)
     }
@@ -403,6 +427,24 @@ impl Coords {
         data.0[self.subindex_left() as usize][self.subindex_top() as usize] = val;
     }
     
+}
+#[repr(u8)]
+enum Test{
+    first = 1,
+    second = 2,
+}
+
+#[repr(transparent)]
+struct TypedSimd<TTyped:Copy, TSimdElement: SimdElement, const LANES:usize> {
+    simd: [Simd<TSimdElement, 64>; size_of::<TTyped>()],
+    _phantom_data: PhantomData<[[[TTyped;8];8]]>
+}
+
+impl<TTyped: Copy, TSimdElement: SimdElement, const LANES: usize> TypedSimd<TTyped, TSimdElement, LANES> {
+    pub fn new(data: [Simd<TSimdElement, 64>; size_of::<TTyped>()]) -> Self {
+        todo!()
+        //todo
+    }
 }
 
 fn main() {
