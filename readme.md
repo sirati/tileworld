@@ -10,3 +10,5 @@ The usage of this 8bit storage may utilise bitfields, may consume the whole u8 o
 there is one giant caveat to all this: This project is not necessary safe if code consuming this library performs SIMD operations resulting in values that are not valid values of the rust type: when converting from bit representation into rust types no sanity/safety checks are performed. 
 
 this does mean that any simd function modifying state should be marked as unsafe, but i am unhappy with how much this would pollute code with unsafe assertions to show that what one does is in fact not unsafe. also as math can be harder to proof correct this assertion may anyway often be wrong...
+I have actually introduced a good way of dealing with this for all vectorized accesses
+i currently just have no way of enforcing this for unvectorized accesses without having to check every time. maybe thats what i just have to do. vectorized accesses should not be used with any frequency anyway

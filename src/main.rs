@@ -7,11 +7,45 @@
 
 use core::simd;
 use std::alloc::Layout;
+use std::borrow::{Borrow, BorrowMut};
+use std::cell::Cell;
+use std::convert::Into;
+use std::error::Error;
+use std::fmt::{Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::mem;
-use std::ops::{Index, IndexMut};
-use std::simd::{mask8x64, u8x64, Simd, SimdElement};
+use std::ops::{BitAnd, Index, IndexMut};
+use std::simd::{mask8x64, u8x64, LaneCount, Simd, SimdElement, SupportedLaneCount};
+use std::simd::prelude::{SimdPartialEq, SimdPartialOrd};
 use not_zero::NotZero;
+use crate::DataValidity::{Invalid, Unchecked, Valid};
+use crate::same_size::{SameAs, SameSizeAs};
+
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo   look at todo.md
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+// todo 
+
 mod not_zero;
 
 #[repr(align(64))]
@@ -240,28 +274,28 @@ impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
     /// SHIFT will low align data
     #[inline(always)]
     fn inspect<const MASK: bool, const SHIFT: bool, Result>
-    (&self, func_simd: fn(&mut Simd<u8, 64>) -> Result) -> Result
+    (&self, func_simd: fn(&Simd<u8, 64>) -> Result) -> Result
     {
         let mut simd = *self.0.as_simd64();
         Self::simd_prep_val::<MASK, SHIFT>(&mut simd);
 
-        func_simd(&mut simd)
+        func_simd(&simd)
     }
 
     /// MASK will replace all other stored data with zero
     /// SHIFT will low align data
     #[inline(always)]
-    const fn inspect_typed<const MASK: bool, const SHIFT: bool, Result, T>
-    (&self, func_simd: fn(&mut Simd<TypedSimd<T, u8>, 64>) -> Result) -> Result
+    fn inspect_typed<const MASK: bool, const SHIFT: bool, Result, T>
+    (&self, func_simd: fn(TypedSimd<T, &[Simd<u8, 64>; size_of::<T>()]>) -> Result) -> Result
     where Feature : TileWorldFeature<Layout, T>,
           Layout: TileWorldLayoutDesc,
-          T: Copy
+          T: FeatureType<SimdRepl = u8>
     {
-        let mut simd = *self.0.as_simd64();
+        let mut simd = *self.0.as_simd64(); //if MASK & SHIFT both false, we dont need this copy
         Self::simd_prep_val::<MASK, SHIFT>(&mut simd);
 
 
-        func_simd(&mut simd)
+        func_simd((&simd).into())
     }
 }
 
@@ -434,18 +468,257 @@ enum Test{
     second = 2,
 }
 
-#[repr(transparent)]
-struct TypedSimd<TTyped:Copy, TSimdElement: SimdElement, const LANES:usize> {
-    simd: [Simd<TSimdElement, 64>; size_of::<TTyped>()],
+
+#[derive(Copy, Clone, PartialEq)]
+enum DataValidity {
+    Unchecked,
+    Valid,
+    Invalid
+}
+#[derive(Debug, Default)]
+struct DataInvalidError();
+
+impl Display for DataInvalidError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DataInvalidError")
+    }
+}
+
+impl Error for DataInvalidError {}
+
+impl Into<DataValidity> for DataInvalidError {
+    fn into(self) -> DataValidity {
+        Invalid
+    }
+}
+
+impl<'a, Feature> Into<TypedSimd<Feature, &'a [Simd<Feature::SimdRepl, { 64 / size_of::<Feature::SimdRepl>() }>; size_of::<Feature>()]>> for &'a Simd<Feature::SimdRepl,  { 64 / size_of::<Feature::SimdRepl>() }>
+where Feature: FeatureType<SimdRepl=u8> + 'a,
+{
+    fn into(self) -> TypedSimd<Feature, &'a [Simd<Feature::SimdRepl, 64>; size_of::<Feature>()]> {
+        let this: &'a [Simd<Feature::SimdRepl, 64>; size_of::<Feature>()] = unsafe {
+            // ### Safety
+            // FeatureType<SimdRepl=u8> enforced size_of::<Feature>() == 1
+            // but the compiler does not understand that
+            &*(self as *const _ as *const [Simd<Feature::SimdRepl, 64>; size_of::<Feature>()])
+        };
+        TypedSimd::new(this)
+    }
+}
+impl<'a, Feature> Into<TypedSimd<Feature, &'a mut [Simd<Feature::SimdRepl,  { 64 / size_of::<Feature::SimdRepl>() }>;size_of::<Feature>()]>> for &'a mut Simd<Feature::SimdRepl,  { 64 / size_of::<Feature::SimdRepl>() }>
+where Feature: FeatureType<SimdRepl=u8> {
+    fn into(self) -> TypedSimd<Feature, &'a mut [Simd<Feature::SimdRepl, 64>;size_of::<Feature>()]> {
+        let this: &'a mut [Simd<Feature::SimdRepl, 64>; size_of::<Feature>()] = unsafe {
+            // ### Safety
+            // FeatureType<SimdRepl=u8> enforced size_of::<Feature>() == 1
+            // but the compiler does not understand that
+            &mut *(self as *mut _ as *mut [Simd<Feature::SimdRepl, 64>; size_of::<Feature>()])
+        };
+        TypedSimd::new(this)
+    }
+}
+impl<Feature> Into<TypedSimd<Feature, [Simd<Feature::SimdRepl,  { 64 / size_of::<Feature::SimdRepl>() }>;size_of::<Feature>()]>> for Simd<Feature::SimdRepl,  { 64 / size_of::<Feature::SimdRepl>() }>
+where Feature: FeatureType<SimdRepl=u8> + SameSizeAs<u8>,
+      Feature::SimdRepl: SameSizeAs<Feature>
+{
+    fn into(self) -> TypedSimd<Feature, [Simd<Feature::SimdRepl, 64>;size_of::<Feature>()]> {
+        TypedSimd::new(<u8 as SameSizeAs<Feature>>::yes_same_array([self]))
+    }
+}
+
+mod same_size {
+    use std::mem;
+    use std::mem::ManuallyDrop;
+
+    trait SameSizeAsSealed<T2> {}
+    trait SameAsSealed<T2> {}
+    pub trait SameAs<T> : SameAsSealed<T>{}
+    impl<T> SameAs<T> for T{}
+    impl<T, T2> SameAsSealed<T2> for T
+    where T: SameAs<T2>{}
+
+    pub trait SameSizeAs<T>: SameSizeAsSealed<T> + Sized {
+        #[inline(always)]
+        fn yes_same_array<T2>(arr: [T2; size_of::<Self>()]) -> [T2; size_of::<T>()] {
+            union UnionTransmute<From, To> {
+                from: ManuallyDrop<From>,
+                to: ManuallyDrop<To>,
+            }
+
+            let union = UnionTransmute {
+                from: ManuallyDrop::new(arr),
+            };
+
+            ManuallyDrop::into_inner( unsafe {union.to})
+        }
+    }
+    impl<T, T2> SameSizeAs<T2> for T
+    where [u8; size_of::<T>()]: SameAs<[u8; size_of::<T2>()]> {}
+    impl<T, T2> SameSizeAsSealed<T2> for T
+    where T: SameSizeAs<T2>{}
+
+}
+
+trait FeatureTypeValidator<SimdRepl: SimdElement + SameSizeAs<Self>, Validator: ValidatorNameZST>: Sized {
+    fn simd_check<const LANES:usize, const ARR_LENGTH:usize>(data: &[Simd<SimdRepl, LANES>;ARR_LENGTH]) -> bool
+    where LaneCount<LANES>: SupportedLaneCount,
+          Simd<SimdRepl, LANES>: SimdPartialOrd,
+          <Simd<SimdRepl, LANES> as SimdPartialEq>::Mask: BitAnd;
+}
+
+trait ValidatorNameZST : SameSizeAs<()>{}
+
+trait FeatureType: Copy + SameSizeAs<Self::SimdRepl> + FeatureTypeValidator<Self::SimdRepl, Self::Validator> {
+    type SimdRepl: SimdElement + SameSizeAs<Self> + Eq;
+    type Validator: ValidatorNameZST;
+
+}
+
+unsafe trait NoFeatureTypeValidator: FeatureType{}
+struct NoFeatureTypeValidatorName{}
+impl ValidatorNameZST for NoFeatureTypeValidatorName{}
+impl<T> FeatureTypeValidator<T::SimdRepl, NoFeatureTypeValidatorName> for T
+where
+    T: NoFeatureTypeValidator + FeatureType<Validator=NoFeatureTypeValidatorName>
+{
+    fn simd_check<const LANES: usize, const ARR_LENGTH: usize>(data: &[Simd<T::SimdRepl, LANES>; ARR_LENGTH]) -> bool
+    where
+        LaneCount<LANES>: SupportedLaneCount
+    {
+        true
+    }
+}
+
+
+unsafe trait RangeFeatureTypeValidator: FeatureType{
+    const MIN: Self::SimdRepl;
+    const MAX: Self::SimdRepl;
+}
+struct RangeFeatureTypeValidatorName{}
+impl ValidatorNameZST for RangeFeatureTypeValidatorName{}
+impl<T> FeatureTypeValidator<T::SimdRepl, RangeFeatureTypeValidatorName> for T
+where
+    T: RangeFeatureTypeValidator + FeatureType<Validator=RangeFeatureTypeValidatorName>
+{
+    fn simd_check<const LANES: usize, const ARR_LENGTH: usize>(data: &[Simd<T::SimdRepl, LANES>; ARR_LENGTH]) -> bool
+    where
+        LaneCount<LANES>: SupportedLaneCount,
+        Simd<T::SimdRepl, LANES>: SimdPartialOrd,
+        <Simd<<T as FeatureType>::SimdRepl, LANES> as SimdPartialEq>::Mask: BitAnd
+    {
+        let min = Simd::<T::SimdRepl, LANES>::splat(T::MIN);
+        let max = Simd::<T::SimdRepl, LANES>::splat(T::MAX);
+
+        data.iter().all(|&vec| {
+            let ge_min = vec.simd_ge(min);
+            let le_max = vec.simd_le(max);
+            (ge_min & le_max).all()
+        })
+        }
+}
+
+
+impl FeatureType for i8 {
+    type SimdRepl = u8;
+    type Validator = NoFeatureTypeValidatorName;
+}
+unsafe impl NoFeatureTypeValidator for i8 {
+}
+
+
+struct TypedSimd<TTyped, Data>
+where
+    TTyped: FeatureType,
+    Data: Borrow<[Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped::SimdRepl>() }>; size_of::<TTyped>()]>,
+    Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped::SimdRepl>() }>: SimdPartialOrd,
+    <Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped::SimdRepl>() }> as SimdPartialEq>::Mask: BitAnd,
+    LaneCount<{ 64 / size_of::<TTyped>() }>: SupportedLaneCount
+{
+    simd: Data,
+    checked: Cell<DataValidity>,
     _phantom_data: PhantomData<[[[TTyped;8];8]]>
 }
 
-impl<TTyped: Copy, TSimdElement: SimdElement, const LANES: usize> TypedSimd<TTyped, TSimdElement, LANES> {
-    pub fn new(data: [Simd<TSimdElement, 64>; size_of::<TTyped>()]) -> Self {
-        todo!()
-        //todo
+impl<TTyped, Data> TypedSimd<TTyped, Data>
+where
+    TTyped: FeatureType,
+    Data: Borrow<[Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped>() }>; size_of::<TTyped>()]>,
+    Simd<TTyped::SimdRepl, 1>: SimdPartialOrd,
+    <Simd<TTyped::SimdRepl, 1> as SimdPartialEq>::Mask: BitAnd,
+    LaneCount<{ 64 / size_of::<TTyped>() }>: SupportedLaneCount
+{
+    pub fn simd_mut(&mut self) -> &mut [Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped>() }>; size_of::<TTyped>()]  {
+        self.checked.set(Unchecked);
+        self.simd.borrow_mut()
+    }
+
+
+    pub fn typed_mut(&mut self) -> Result<&mut [[TTyped;8];8],DataInvalidError>  {
+        self.check()?;
+        Ok(unsafe {
+            &mut*(self.simd.borrow_mut() as *mut _ as *mut [[TTyped;8];8])
+        })
     }
 }
+
+impl<TTyped, Data> TypedSimd<TTyped, Data>
+where
+    TTyped: FeatureType,
+    Data: Borrow<[Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped>() }>; size_of::<TTyped>()]>,
+    Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped>() }>: SimdPartialOrd,
+    <Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped>() }> as SimdPartialEq>::Mask: BitAnd,
+    LaneCount<{ 64 / size_of::<TTyped>() }>: SupportedLaneCount
+{
+    pub fn new(data: Data) -> Self {
+        Self {
+            simd: data,
+            checked: Cell::new(Unchecked),
+            _phantom_data: PhantomData
+        }
+    }
+
+    pub fn simd(&self) -> &[Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped>() }>; size_of::<TTyped>()] {
+        self.simd.borrow()
+    }
+
+
+    /// checks if the data is valid for TTyped is it may have gotten invalidated (e.g. by simd_mut)
+    pub fn check(&self) -> Result<(),DataInvalidError>  {
+        if self.checked.get() == Unchecked {
+            self.checked.set(match TTyped::simd_check(self.simd()) {
+                true => Valid,
+                false => Invalid
+            });
+        }
+        match self.checked.get() {
+            Invalid => Err(DataInvalidError()),
+            _ => Ok(())
+        }
+    }
+
+    pub fn typed(&self) -> Result<&[[TTyped;8];8],DataInvalidError> {
+        self.check()?;
+        Ok(unsafe {
+            &*(self.simd.borrow() as *const _ as *const [[TTyped;8];8])
+        })
+    }
+}
+
+
+#[derive(Copy, Clone)]
+#[repr(u8)]
+enum TestFeature{
+    Grassland = 1,
+    Forest = 2,
+
+}
+
+impl FeatureType for TestFeature {
+    type SimdRepl = u8;
+
+}
+
+struct TestFeatureLayout();
 
 fn main() {
     println!("{}", size_of::<NotZero>());
