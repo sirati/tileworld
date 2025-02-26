@@ -1,6 +1,7 @@
 [package]
 name = "tileworld"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
+disjoint_impls = "0.8.0"

@@ -5,6 +5,8 @@
 #![feature(transparent_unions)]
 #![feature(repr_simd)]
 
+use crate::SimdHelper::{MaskInner, SignedPair2};
+use crate::SimdHelper::{MaskM, MaskMathable, SimdM, SimdMathable};
 use core::simd;
 use std::alloc::Layout;
 use std::borrow::{Borrow, BorrowMut};
@@ -12,14 +14,15 @@ use std::cell::Cell;
 use std::convert::Into;
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
+use std::hint::unreachable_unchecked;
 use std::marker::PhantomData;
 use std::mem;
-use std::ops::{BitAnd, Index, IndexMut};
-use std::simd::{mask8x64, u8x64, LaneCount, Simd, SimdElement, SupportedLaneCount};
+use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Index, IndexMut};
+use std::simd::{mask8x64, u8x64, LaneCount, Mask, Simd, SimdElement, SupportedLaneCount};
 use std::simd::prelude::{SimdPartialEq, SimdPartialOrd};
 use not_zero::NotZero;
 use crate::DataValidity::{Invalid, Unchecked, Valid};
-use crate::same_size::{SameAs, SameSizeAs};
+use crate::same_size::{FlattenConstSizeArr, SameAs, SameSizeAs};
 
 // todo 
 // todo 
@@ -49,25 +52,36 @@ use crate::same_size::{SameAs, SameSizeAs};
 mod not_zero;
 
 #[repr(align(64))]
-struct SubRegionAligned([[u8;8];8]);
+struct Chunk2dCacheLine([[u8;8];8]);
+#[repr(align(4096))] //Index by
+struct Chunk2dPageSize([[[Chunk2dCacheLine;4];4];4]);
 
-impl<'a, Feature: TileWorldFeatureAccessorRaw> Into<&'a FeatureSubRegion<Feature>> for &'a SubRegionAligned {
+impl Index<Coord> for Chunk2dPageSize {
+    type Output = [Chunk2dCacheLine;4];
+
+    #[inline(always)]
+    fn index(&self, index: Coord) -> &Self::Output {
+        &(self.0.flatten_ref())[index.region_subindex as usize]
+    }
+}
+
+impl<'a, Feature: TileWorldFeatureAccessorRaw> Into<&'a FeatureSubRegion<Feature>> for &'a Chunk2dCacheLine {
     fn into(self) -> &'a FeatureSubRegion<Feature> {
         unsafe {
-            &*(self as *const SubRegionAligned as *const FeatureSubRegion<Feature>)
+            &*(self as *const Chunk2dCacheLine as *const FeatureSubRegion<Feature>)
         }
     }
 }
 
-impl<'a, Feature: TileWorldFeatureAccessorRaw> Into<&'a mut FeatureSubRegion<Feature>> for &'a mut SubRegionAligned {
+impl<'a, Feature: TileWorldFeatureAccessorRaw> Into<&'a mut FeatureSubRegion<Feature>> for &'a mut Chunk2dCacheLine {
     fn into(self) -> &'a mut FeatureSubRegion<Feature> {
         unsafe {
-            &mut*(self as *mut SubRegionAligned as *mut FeatureSubRegion<Feature>)
+            &mut*(self as *mut Chunk2dCacheLine as *mut FeatureSubRegion<Feature>)
         }
     }
 }
 
-impl SubRegionAligned {
+impl Chunk2dCacheLine {
     #[inline(always)]
     fn as_simd<const LANES: usize>(&self) -> &[Simd<u8, LANES>]
     where
@@ -77,13 +91,16 @@ impl SubRegionAligned {
             &*(self as *const Self as *const [u8; 64])
         };*/
         let (pre, simd, post) = self.0.as_flattened().as_simd();
-        assert_eq!(pre.len(), 0);
-        assert_eq!(post.len(), 0);
+        assert_eq!(align_of::<Self>(), 64);
+        assert_eq!(64, LANES * simd.len());
+        if (pre.len() != 0 || post.len() != 0) {
+            unsafe { unreachable_unchecked() }
+        }
         simd
     }
 
     #[inline(always)]
-    fn as_simd64(&self) -> &Simd<u8, 64> {
+    fn as_simd64(&self) -> &SimdM<u8, 64> {
         let lanes = self.as_simd::<64>();
         assert_eq!(lanes.len(), 1);
         &lanes[0]
@@ -113,19 +130,19 @@ impl SubRegionAligned {
 
 }
 
-impl IndexMut<Coords> for SubRegionAligned {
+impl IndexMut<Coord> for Chunk2dCacheLine {
     #[inline(always)]
-    fn index_mut(&mut self, index: Coords) -> &mut Self::Output {
+    fn index_mut(&mut self, index: Coord) -> &mut Self::Output {
         index.get_single_flag_mut(self)
     }
 }
-impl IndexMut<u8> for SubRegionAligned {
+impl IndexMut<u8> for Chunk2dCacheLine {
     #[inline(always)]
     fn index_mut(&mut self, index: u8) -> &mut Self::Output {
         &mut self[index as usize]
     }
 }
-impl IndexMut<usize> for SubRegionAligned {
+impl IndexMut<usize> for Chunk2dCacheLine {
     #[inline(always)]
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.0[index]
@@ -133,16 +150,16 @@ impl IndexMut<usize> for SubRegionAligned {
 }
 
 
-impl Index<Coords> for SubRegionAligned {
+impl Index<Coord> for Chunk2dCacheLine {
     type Output = u8;
 
     #[inline(always)]
-    fn index(&self, index: Coords) -> &Self::Output {
+    fn index(&self, index: Coord) -> &Self::Output {
         &index.get_single_flag_ref(self)
     }
 }
 
-impl Index<u8> for SubRegionAligned {
+impl Index<u8> for Chunk2dCacheLine {
     type Output = [u8;8];
 
     #[inline(always)]
@@ -151,7 +168,7 @@ impl Index<u8> for SubRegionAligned {
     }
 }
 
-impl Index<usize> for SubRegionAligned {
+impl Index<usize> for Chunk2dCacheLine {
     type Output = [u8;8];
 
     #[inline(always)]
@@ -162,7 +179,7 @@ impl Index<usize> for SubRegionAligned {
 
 
 #[repr(transparent)]
-struct FeatureSubRegion<Feature: TileWorldFeatureAccessorRaw>(SubRegionAligned, PhantomData<Feature>);
+struct FeatureSubRegion<Feature: TileWorldFeatureAccessorRaw>(Chunk2dCacheLine, PhantomData<Feature>);
 
 impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
 
@@ -274,7 +291,7 @@ impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
     /// SHIFT will low align data
     #[inline(always)]
     fn inspect<const MASK: bool, const SHIFT: bool, Result>
-    (&self, func_simd: fn(&Simd<u8, 64>) -> Result) -> Result
+    (&self, func_simd: fn(&SimdM<u8, 64>) -> Result) -> Result
     {
         let mut simd = *self.0.as_simd64();
         Self::simd_prep_val::<MASK, SHIFT>(&mut simd);
@@ -286,7 +303,7 @@ impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
     /// SHIFT will low align data
     #[inline(always)]
     fn inspect_typed<const MASK: bool, const SHIFT: bool, Result, T>
-    (&self, func_simd: fn(TypedSimd<T, &[Simd<u8, 64>; size_of::<T>()]>) -> Result) -> Result
+    (&self, func_simd: fn(TypedSimd<T, &SimdM<u8, 64>>) -> Result) -> Result
     where Feature : TileWorldFeature<Layout, T>,
           Layout: TileWorldLayoutDesc,
           T: FeatureType<SimdRepl = u8>
@@ -295,11 +312,11 @@ impl<Feature: TileWorldFeatureAccessorRaw> FeatureSubRegion<Feature> {
         Self::simd_prep_val::<MASK, SHIFT>(&mut simd);
 
 
-        func_simd((&simd).into())
+        func_simd(TypedSimd::new(&simd))
     }
 }
 
-type TileWorldData<Layout: TileWorldLayoutDesc> = [SubRegionAligned;Layout::LAYERS as usize];
+type TileWorldData<Layout: TileWorldLayoutDesc> = [Chunk2dPageSize;Layout::LAYERS as usize];
 
 struct TileWorld<Layout: TileWorldLayoutDesc> where [(); Layout::LAYERS as usize]:{
     data: Box<[TileWorldData<Layout>]>,
@@ -320,6 +337,8 @@ trait TileWorldFeatureAccessorRaw {
     const VAL_MASK_RIGHT_SHIFT: u8 = 8 - Self::VAL_MASK_LEFT_SHIFT;             // =5     _____
     const VAL_MASK: u8 = (((1u16 << Self::BITS) - 1) as u8) << Self::OFFSET;    //     00011100
     const ERASE_MASK: u8 = !Self::VAL_MASK;                                     //     11100011
+    const LAYER_MAJOR: u16 = Self::LAYER >> 2;
+    const LAYER_MINOR: u16 = Self::LAYER & 0b0011;
     
 }
 
@@ -356,41 +375,41 @@ impl<Layout: TileWorldLayoutDesc> TileWorld<Layout> where [(); Layout::LAYERS as
 
 
     #[inline(always)]
-    const fn get_region_arr(&self, coords: Coords) -> &TileWorldData<Layout>  {
+    const fn get_region_arr(&self, coords: Coord) -> &TileWorldData<Layout>  {
         &self.data[coords.region_index(self.region_width)]
     }
 
     #[inline(always)]
-    const fn get_region_arr_mut(&mut self, coords: Coords) -> &mut TileWorldData<Layout>  {
+    const fn get_region_arr_mut(&mut self, coords: Coord) -> &mut TileWorldData<Layout>  {
         &mut self.data[coords.region_index(self.region_width)]
     }
 
 
     #[inline(always)]
-    const fn get_region<Accessor>(&self, coords: Coords) -> &SubRegionAligned
+    const fn get_region<Accessor>(&self, coords: Coord) -> &Chunk2dCacheLine
     where Accessor: TileWorldFeatureAccessor<Layout>
     {
-        &self.get_region_arr(coords)[Accessor::LAYER as usize]
+        &self.get_region_arr(coords)[Accessor::LAYER_MAJOR as usize][coords][Accessor::LAYER_MINOR as usize]
     }
 
 
     #[inline(always)]
-    const fn get_region_mut<Accessor>(&mut self, coords: Coords) -> &mut SubRegionAligned
+    const fn get_region_mut<Accessor>(&mut self, coords: Coord) -> &mut Chunk2dCacheLine
     where Accessor: TileWorldFeatureAccessor<Layout>
     {
-        &mut self.get_region_arr_mut(coords)[Accessor::LAYER as usize]
+        &mut self.get_region_arr_mut(coords)[Accessor::LAYER_MAJOR as usize][coords][Accessor::LAYER_MINOR as usize]
     }
 
 
     #[inline(always)]
-    fn get<Accessor, T>(&self, coords: Coords) -> T
+    fn get<Accessor, T>(&self, coords: Coord) -> T
     where Accessor: TileWorldFeature<Layout, T>, T: Copy
     {
         Accessor::map(coords.get_single_flag(self.get_region::<Accessor>(coords)))
     }
 
     #[inline(always)]
-    fn set<Accessor, T>(&mut self, coords: Coords, val: T)
+    fn set<Accessor, T>(&mut self, coords: Coord, val: T)
     where Accessor: TileWorldFeature<Layout, T>, T: Copy
     {
         Accessor::set(coords.get_single_flag_mut(self.get_region_mut::<Accessor>(coords)), val);
@@ -398,40 +417,52 @@ impl<Layout: TileWorldLayoutDesc> TileWorld<Layout> where [(); Layout::LAYERS as
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
-struct Coords{
-    region_left: u16,
-    region_top: u16,
+struct Coord {
+    region_left: u8,
+    region_top: u8,
     region_subindex: u8,
+    chunk_subindex: u8,
 }
 
-impl Coords {
+impl Coord {
     #[inline(always)]
     const fn new(left: usize, top: usize) -> Self {
         Self {
-            region_left: (left >> 3) as u16,
-            region_top: (top >> 3) as u16,
-            region_subindex: (left as u8 & 7) | ((top as u8 & 7) << 3),
+            region_left: (left >> 5) as u8,
+            region_top: (top >> 5) as u8,
+            region_subindex: ((left as u8 & 0b0001_1000) >> 1) | ((top as u8 & 0b0001_1000) << 1),
+            chunk_subindex: (left as u8 & 0b0000_0111) | ((top as u8 & 0b0000_0111) << 3),
         }
     }
 
     #[inline(always)]
-    const fn subindex_left(self) -> u8 {
-        self.region_subindex & 7
+    const fn chunk_left(self) -> u8 {
+        self.chunk_subindex & 0b111
     }
 
     #[inline(always)]
-    const fn subindex_top(self) -> u8 {
-        self.region_subindex & 7
+    const fn chunk_top(self) -> u8 {
+        self.chunk_subindex >> 3
+    }
+
+    #[inline(always)]
+    const fn subregion_left(self) -> u8 {
+        self.chunk_subindex & 0b11
+    }
+
+    #[inline(always)]
+    const fn subregion_top(self) -> u8 {
+        self.chunk_subindex >> 2
     }
 
     #[inline(always)]
     const fn left(self) -> usize {
-        ((self.region_left as usize) << 3) | self.subindex_left() as usize
+        ((self.region_left as usize) << 3) | self.chunk_left() as usize
     }
 
     #[inline(always)]
     const fn top(self) -> usize {
-        ((self.region_left as usize) << 3) | self.subindex_top() as usize
+        ((self.region_left as usize) << 3) | self.chunk_top() as usize
     }
 
     #[inline(always)]
@@ -441,24 +472,24 @@ impl Coords {
 
 
     #[inline(always)]
-    const fn get_single_flag(self, data: &SubRegionAligned) -> u8 {
+    const fn get_single_flag(self, data: &Chunk2dCacheLine) -> u8 {
         //if we use the Index impl it's no longer const-able....
-        data.0[self.subindex_left() as usize][self.subindex_top() as usize]
+        data.0[self.chunk_left() as usize][self.chunk_top() as usize]
     }
     #[inline(always)]
-    const fn get_single_flag_ref(self, data: &SubRegionAligned) -> &u8 {
+    const fn get_single_flag_ref(self, data: &Chunk2dCacheLine) -> &u8 {
         //if we use the Index impl it's no longer const-able....
-        &data.0[self.subindex_left() as usize][self.subindex_top() as usize]
+        &data.0[self.chunk_left() as usize][self.chunk_top() as usize]
     }
 
     #[inline(always)]
-    const fn get_single_flag_mut(self, data: &mut SubRegionAligned) -> &mut u8 {
-        &mut data.0[self.subindex_left() as usize][self.subindex_top() as usize]
+    const fn get_single_flag_mut(self, data: &mut Chunk2dCacheLine) -> &mut u8 {
+        &mut data.0[self.chunk_left() as usize][self.chunk_top() as usize]
     }
 
     #[inline(always)]
-    const fn set_single_flag(self, data: &mut SubRegionAligned, val: u8) {
-        data.0[self.subindex_left() as usize][self.subindex_top() as usize] = val;
+    const fn set_single_flag(self, data: &mut Chunk2dCacheLine, val: u8) {
+        data.0[self.chunk_left() as usize][self.chunk_top() as usize] = val;
     }
     
 }
@@ -492,48 +523,20 @@ impl Into<DataValidity> for DataInvalidError {
     }
 }
 
-impl<'a, Feature> Into<TypedSimd<Feature, &'a [Simd<Feature::SimdRepl, { 64 / size_of::<Feature::SimdRepl>() }>; size_of::<Feature>()]>> for &'a Simd<Feature::SimdRepl,  { 64 / size_of::<Feature::SimdRepl>() }>
-where Feature: FeatureType<SimdRepl=u8> + 'a,
-{
-    fn into(self) -> TypedSimd<Feature, &'a [Simd<Feature::SimdRepl, 64>; size_of::<Feature>()]> {
-        let this: &'a [Simd<Feature::SimdRepl, 64>; size_of::<Feature>()] = unsafe {
-            // ### Safety
-            // FeatureType<SimdRepl=u8> enforced size_of::<Feature>() == 1
-            // but the compiler does not understand that
-            &*(self as *const _ as *const [Simd<Feature::SimdRepl, 64>; size_of::<Feature>()])
-        };
-        TypedSimd::new(this)
-    }
-}
-impl<'a, Feature> Into<TypedSimd<Feature, &'a mut [Simd<Feature::SimdRepl,  { 64 / size_of::<Feature::SimdRepl>() }>;size_of::<Feature>()]>> for &'a mut Simd<Feature::SimdRepl,  { 64 / size_of::<Feature::SimdRepl>() }>
-where Feature: FeatureType<SimdRepl=u8> {
-    fn into(self) -> TypedSimd<Feature, &'a mut [Simd<Feature::SimdRepl, 64>;size_of::<Feature>()]> {
-        let this: &'a mut [Simd<Feature::SimdRepl, 64>; size_of::<Feature>()] = unsafe {
-            // ### Safety
-            // FeatureType<SimdRepl=u8> enforced size_of::<Feature>() == 1
-            // but the compiler does not understand that
-            &mut *(self as *mut _ as *mut [Simd<Feature::SimdRepl, 64>; size_of::<Feature>()])
-        };
-        TypedSimd::new(this)
-    }
-}
-impl<Feature> Into<TypedSimd<Feature, [Simd<Feature::SimdRepl,  { 64 / size_of::<Feature::SimdRepl>() }>;size_of::<Feature>()]>> for Simd<Feature::SimdRepl,  { 64 / size_of::<Feature::SimdRepl>() }>
-where Feature: FeatureType<SimdRepl=u8> + SameSizeAs<u8>,
-      Feature::SimdRepl: SameSizeAs<Feature>
-{
-    fn into(self) -> TypedSimd<Feature, [Simd<Feature::SimdRepl, 64>;size_of::<Feature>()]> {
-        TypedSimd::new(<u8 as SameSizeAs<Feature>>::yes_same_array([self]))
-    }
-}
-
 mod same_size {
     use std::mem;
     use std::mem::ManuallyDrop;
 
     trait SameSizeAsSealed<T2> {}
     trait SameAsSealed<T2> {}
-    pub trait SameAs<T> : SameAsSealed<T>{}
-    impl<T> SameAs<T> for T{}
+    pub trait SameAs<T> : SameAsSealed<T>{
+        fn into_same(self) -> T;
+    }
+    impl<T> SameAs<T> for T{
+        fn into_same(self) -> T {
+            self
+        }
+    }
     impl<T, T2> SameAsSealed<T2> for T
     where T: SameAs<T2>{}
 
@@ -557,19 +560,39 @@ mod same_size {
     impl<T, T2> SameSizeAsSealed<T2> for T
     where T: SameSizeAs<T2>{}
 
+    pub trait FlattenConstSizeArr<T, const D1: usize,const D2: usize> where Self: SameAs<[[T;D1];D2]> {
+        fn flatten_ref(&self) -> &[T;(D1*D2)];
+        fn flatten_mut(&mut self) -> &mut[T;(D1*D2)];
+    }
+
+    //todo check if we must enforce alignment?
+    impl<T, const D1: usize,const D2: usize> FlattenConstSizeArr<T, D1, D2> for [[T;D1];D2]  {
+        fn flatten_ref(&self) -> &[T; (D1*D2)] {
+            unsafe {
+                &*(self as *const _ as *const [T; (D1*D2)])
+            }
+        }
+
+        fn flatten_mut(&mut self) -> &mut [T; (D1*D2)] {
+            unsafe {
+                &mut *(self as *mut _ as *mut [T; (D1*D2)])
+            }
+        }
+    }
+
 }
 
-trait FeatureTypeValidator<SimdRepl: SimdElement + SameSizeAs<Self>, Validator: ValidatorNameZST>: Sized {
-    fn simd_check<const LANES:usize, const ARR_LENGTH:usize>(data: &[Simd<SimdRepl, LANES>;ARR_LENGTH]) -> bool
+trait FeatureTypeValidator<SimdRepl: SimdElement + SameSizeAs<Self> + SimdHelper::SignedPair2, Validator: ValidatorNameZST>: Sized {
+    fn simd_check<const LANES:usize>(data: &SimdM<SimdRepl, LANES>) -> bool
     where LaneCount<LANES>: SupportedLaneCount,
-          Simd<SimdRepl, LANES>: SimdPartialOrd,
-          <Simd<SimdRepl, LANES> as SimdPartialEq>::Mask: BitAnd;
+          SimdM<SimdRepl, LANES>: SimdMathable<SimdRepl, LANES>,
+          MaskInner<SimdRepl, LANES>: MaskMathable<SimdRepl, LANES>;
 }
 
 trait ValidatorNameZST : SameSizeAs<()>{}
 
 trait FeatureType: Copy + SameSizeAs<Self::SimdRepl> + FeatureTypeValidator<Self::SimdRepl, Self::Validator> {
-    type SimdRepl: SimdElement + SameSizeAs<Self> + Eq;
+    type SimdRepl: SimdElement + SameSizeAs<Self> + Eq + SignedPair2;
     type Validator: ValidatorNameZST;
 
 }
@@ -581,7 +604,7 @@ impl<T> FeatureTypeValidator<T::SimdRepl, NoFeatureTypeValidatorName> for T
 where
     T: NoFeatureTypeValidator + FeatureType<Validator=NoFeatureTypeValidatorName>
 {
-    fn simd_check<const LANES: usize, const ARR_LENGTH: usize>(data: &[Simd<T::SimdRepl, LANES>; ARR_LENGTH]) -> bool
+    fn simd_check<const LANES: usize>(data: &SimdM<T::SimdRepl, LANES>) -> bool
     where
         LaneCount<LANES>: SupportedLaneCount
     {
@@ -600,21 +623,23 @@ impl<T> FeatureTypeValidator<T::SimdRepl, RangeFeatureTypeValidatorName> for T
 where
     T: RangeFeatureTypeValidator + FeatureType<Validator=RangeFeatureTypeValidatorName>
 {
-    fn simd_check<const LANES: usize, const ARR_LENGTH: usize>(data: &[Simd<T::SimdRepl, LANES>; ARR_LENGTH]) -> bool
-    where
-        LaneCount<LANES>: SupportedLaneCount,
-        Simd<T::SimdRepl, LANES>: SimdPartialOrd,
-        <Simd<<T as FeatureType>::SimdRepl, LANES> as SimdPartialEq>::Mask: BitAnd
+    fn simd_check<const LANES:usize>(data: &SimdM<T::SimdRepl, LANES>) -> bool
+    where LaneCount<LANES>: SupportedLaneCount,
+          SimdM<T::SimdRepl, LANES>: SimdMathable<T::SimdRepl, LANES>,
+          MaskInner<T::SimdRepl, LANES>: MaskMathable<T::SimdRepl, LANES>,
     {
-        let min = Simd::<T::SimdRepl, LANES>::splat(T::MIN);
-        let max = Simd::<T::SimdRepl, LANES>::splat(T::MAX);
+        let min = SimdM::<T::SimdRepl, LANES>::splat(T::MIN);
+        let max = SimdM::<T::SimdRepl, LANES>::splat(T::MAX);
 
-        data.iter().all(|&vec| {
-            let ge_min = vec.simd_ge(min);
-            let le_max = vec.simd_le(max);
-            (ge_min & le_max).all()
-        })
-        }
+        let ge_min = (*data).simd_ge(min);
+        let le_max = (*data).simd_le(max);
+        
+        let x: MaskM<T::SimdRepl, LANES> = (ge_min & le_max).into_same();
+        
+        
+        //x.all()
+        true
+    }
 }
 
 
@@ -629,25 +654,145 @@ unsafe impl NoFeatureTypeValidator for i8 {
 struct TypedSimd<TTyped, Data>
 where
     TTyped: FeatureType,
-    Data: Borrow<[Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped::SimdRepl>() }>; size_of::<TTyped>()]>,
-    Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped::SimdRepl>() }>: SimdPartialOrd,
-    <Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped::SimdRepl>() }> as SimdPartialEq>::Mask: BitAnd,
-    LaneCount<{ 64 / size_of::<TTyped>() }>: SupportedLaneCount
+    Data: Borrow<SimdM<TTyped::SimdRepl, 64>>,
+    SimdM<TTyped::SimdRepl, 64>: SimdMathable<TTyped::SimdRepl, 64>,
+    MaskInner<TTyped::SimdRepl, 64>: MaskMathable<TTyped::SimdRepl, 64>,
 {
     simd: Data,
     checked: Cell<DataValidity>,
     _phantom_data: PhantomData<[[[TTyped;8];8]]>
 }
 
+mod SimdHelper {
+    use std::ops::{BitAnd, BitOr};
+    use std::simd::cmp::SimdPartialOrd;
+    use std::simd::{LaneCount, Mask, MaskElement, Simd, SimdElement, SupportedLaneCount};
+    use std::simd::prelude::SimdPartialEq;
+    use crate::same_size::SameAs;
+
+    trait Sealed{}
+
+    pub type MaskInner<T, const N: usize>
+    where Simd<T, N>: SimdMathable<T, N>,
+          MaskInner<T, N>: MaskMathable<T, N> + BitAnd<Output=MaskInner<T, N>> + BitOr<Output=MaskInner<T, N>>,
+          T: SignedPair2,
+
+    = <Simd<T, N> as SimdPartialEq>::Mask;
+
+    pub type MaskM<T, const N: usize>
+    where Simd<T, N>: SimdMathable<T, N>,
+          MaskInner<T, N>: MaskMathable<T, N>
+          + BitAnd<Output=MaskM<T, N>>
+          + BitOr<Output=MaskM<T, N>>,
+          Mask<T::Signed, N>: SameAs<<Simd<T, N> as SimdPartialEq>::Mask>,
+          T: SignedPair2,
+
+    = Mask<T::Signed, N>;
+
+    pub type SimdM<T, const N: usize>
+    where
+        SimdM<T, N>: SimdMathable<T, N>,
+        LaneCount<N>: SupportedLaneCount,
+        T: SimdElement + SignedPair2,
+        MaskM<T, N>: MaskMathable<T, N>
+    = Simd<T, N>;
+
+
+    trait Signed: SignedPair<Self, <Self as Signed>::Unsigned> + MaskElement{
+        type Unsigned: Unsigned<Signed=Self>;
+    }
+
+    trait SignedPair<TSigned: Signed + MaskElement, TUnSigned: Unsigned>: Sized{}
+    trait Unsigned : SignedPair<Self::Signed, Self>{
+        type Signed: Signed<Unsigned=Self>;
+    }
+
+    pub trait SignedPair2{
+        type Signed: Signed<Unsigned=Self::Unsigned>;
+        type Unsigned: Unsigned<Signed=Self::Signed>;
+    }
+
+    macro_rules! ImplSignedPair {
+    ($signed:ty, $unsigned:ty) => {
+            impl Unsigned for $unsigned {
+                type Signed = $signed;
+            }
+            impl Signed for $signed {
+                type Unsigned = $unsigned;
+            }
+            impl SignedPair2 for $unsigned {
+                type Signed = $signed;
+                type Unsigned = $unsigned;
+            }
+            impl SignedPair2 for $signed {
+                type Signed = $signed;
+                type Unsigned = $unsigned;
+            }
+            impl SignedPair<$signed, $unsigned> for $signed{}
+            impl SignedPair<$signed, $unsigned> for $unsigned{}
+        }
+    }
+    ImplSignedPair!(i8, u8);
+    ImplSignedPair!(i16, u16);
+    ImplSignedPair!(i32, u32);
+    ImplSignedPair!(i64, u64);
+    ImplSignedPair!(isize, usize);
+
+
+
+
+    pub trait MaskMathable<T, const N: usize> : SimdPartialOrd + Sized/* + SameAs<MaskM<T, N>>*/
+    where
+        Self: BitAnd<Output=Self> + BitOr<Output=Self> + SameAs<MaskM<T, N>> /*+ SameAs<MaskInner<T, N>>*/ + SimdPartialEq,
+        T: SimdElement + SignedPair2,
+        LaneCount<N>: SupportedLaneCount,
+        Simd<T, N>: SimdPartialEq
+    {}
+    
+    impl<T, const N: usize> MaskMathable<T, N> for MaskM<T, N>
+    where 
+        Self: SimdPartialOrd + SimdPartialEq + Sized,
+        LaneCount<N>: SupportedLaneCount,
+        T: SimdElement + SignedPair2,
+        Simd<T, N>: SimdPartialEq,
+        Self: BitAnd<Output=Self> + BitOr<Output=Self>
+    {}
+
+    
+    pub trait SimdMathable<T, const N: usize> : SimdPartialOrd + Sealed
+    where
+        LaneCount<N>: SupportedLaneCount,
+        T: SimdElement,
+        Self::Mask: BitAnd<Output=Self::Mask> + BitOr<Output=Self::Mask> /*+ BitAndAssign<Self::Mask> + BitOrAssign<Self::Mask>*/
+    {}
+
+    impl<T, const N: usize> SimdMathable<T, N> for SimdM<T, N>
+    where
+        Self: SimdPartialOrd,
+        LaneCount<N>: SupportedLaneCount,
+        T: SimdElement,
+        Self::Mask: BitAnd<Output=Self::Mask> + BitOr<Output=Self::Mask> /*+ BitAndAssign<Self::Mask> + BitOrAssign<Self::Mask>*/
+    {}
+
+    impl<T, const N: usize> Sealed for SimdM<T, N> where
+        Self: SimdPartialOrd,
+        LaneCount<N>: SupportedLaneCount,
+        T: SimdElement,
+        <Self as SimdPartialEq>::Mask: BitAnd<Output=<Self as SimdPartialEq>::Mask> + BitOr<Output=<Self as SimdPartialEq>::Mask> /*+ BitAndAssign<Self::Mask> + BitOrAssign<Self::Mask>*/
+    {}
+    
+}
+
+
 impl<TTyped, Data> TypedSimd<TTyped, Data>
 where
     TTyped: FeatureType,
-    Data: Borrow<[Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped>() }>; size_of::<TTyped>()]>,
-    Simd<TTyped::SimdRepl, 1>: SimdPartialOrd,
-    <Simd<TTyped::SimdRepl, 1> as SimdPartialEq>::Mask: BitAnd,
-    LaneCount<{ 64 / size_of::<TTyped>() }>: SupportedLaneCount
+    Data: BorrowMut<SimdM<TTyped::SimdRepl, 64>>,
+    SimdM<TTyped::SimdRepl, 64>: SimdMathable<TTyped::SimdRepl, 64>,
+    MaskInner<TTyped::SimdRepl, 64>: MaskMathable<TTyped::SimdRepl, 64>,
+    LaneCount<64>: SupportedLaneCount
 {
-    pub fn simd_mut(&mut self) -> &mut [Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped>() }>; size_of::<TTyped>()]  {
+    pub fn simd_mut(&mut self) -> &mut Simd<TTyped::SimdRepl, 64>  {
         self.checked.set(Unchecked);
         self.simd.borrow_mut()
     }
@@ -664,10 +809,9 @@ where
 impl<TTyped, Data> TypedSimd<TTyped, Data>
 where
     TTyped: FeatureType,
-    Data: Borrow<[Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped>() }>; size_of::<TTyped>()]>,
-    Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped>() }>: SimdPartialOrd,
-    <Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped>() }> as SimdPartialEq>::Mask: BitAnd,
-    LaneCount<{ 64 / size_of::<TTyped>() }>: SupportedLaneCount
+    Data: Borrow<SimdM<TTyped::SimdRepl, 64>>,
+    SimdM<TTyped::SimdRepl, 64>: SimdMathable<TTyped::SimdRepl, 64>,
+    MaskInner<TTyped::SimdRepl, 64>: MaskMathable<TTyped::SimdRepl, 64>,
 {
     pub fn new(data: Data) -> Self {
         Self {
@@ -677,7 +821,7 @@ where
         }
     }
 
-    pub fn simd(&self) -> &[Simd<TTyped::SimdRepl, { 64 / size_of::<TTyped>() }>; size_of::<TTyped>()] {
+    pub fn simd(&self) -> &SimdM<TTyped::SimdRepl, 64> {
         self.simd.borrow()
     }
 
@@ -715,9 +859,10 @@ enum TestFeature{
 
 impl FeatureType for TestFeature {
     type SimdRepl = u8;
-
+    type Validator = NoFeatureTypeValidatorName;
 }
 
+unsafe impl NoFeatureTypeValidator for TestFeature{}
 struct TestFeatureLayout();
 
 fn main() {
